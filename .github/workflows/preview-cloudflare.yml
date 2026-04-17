@@ -1,4 +1,4 @@
-name: Deploy Preview
+name: Deploy Preview (Cloudflare)
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - main
 
 concurrency:
-  group: preview-${{ github.ref }}
+  group: preview-cf-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
