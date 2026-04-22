@@ -36,18 +36,38 @@ jobs:
         run: npm install -g wrangler
 
       - name: Deploy to Cloudflare Pages
-        run: wrangler pages deploy dist --project-name=prototyping-playground --branch=${{ github.ref_name }}
+        id: deploy
+        run: |
+          set -o pipefail
+          wrangler pages deploy dist --project-name=prototyping-playground --branch=${{ github.ref_name }} | tee deploy.log
+          # Extract the atomic deployment URL (e.g. https://6c27979f.prototyping-playground.pages.dev)
+          commit_url=$(grep -oE 'https://[a-f0-9]+\.prototyping-playground\.pages\.dev' deploy.log | head -1)
+          echo "commit_url=${commit_url}" >> "$GITHUB_OUTPUT"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Comment preview URL on PR
         uses: actions/github-script@v7
+        env:
+          COMMIT_URL: ${{ steps.deploy.outputs.commit_url }}
         with:
           script: |
             const branch = context.ref.replace('refs/heads/', '');
             const safeBranch = branch.replace(/[\/]/g, '-').substring(0, 60);
-            const url = `https://${safeBranch}.prototyping-playground.pages.dev`;
+            const branchUrl = `https://${safeBranch}.prototyping-playground.pages.dev`;
+            const commitUrl = process.env.COMMIT_URL;
+            const sha = context.sha;
+            const shortSha = sha.substring(0, 7);
+            const commitLink = `https://github.com/${context.repo.owner}/${context.repo.repo}/commit/${sha}`;
+
+            // Get commit message (first line only)
+            const { data: commit } = await github.rest.repos.getCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: sha,
+            });
+            const message = (commit.commit.message.split('\n')[0] || '').replace(/\|/g, '\\|').substring(0, 80);
 
             const { data: prs } = await github.rest.pulls.list({
               owner: context.repo.owner,
@@ -59,13 +79,42 @@ jobs:
 
             const pr = prs[0];
             const marker = '<!-- cf-preview -->';
-            const body = `${marker}\n**Preview:** ${url}`;
+            const tableHeader = '| Commit | Message | Preview |\n|--------|---------|---------|';
+            const newRow = `| [\`${shortSha}\`](${commitLink}) | ${message} | ${commitUrl || 'n/a'} |`;
+
+            // Read existing comment, extract prior rows
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: pr.number,
             });
             const existing = comments.find(c => c.body?.includes(marker));
+
+            let priorRows = [];
+            if (existing) {
+              const lines = existing.body.split('\n');
+              const tableStart = lines.findIndex(l => l.startsWith('| Commit |'));
+              if (tableStart >= 0) {
+                // Skip header (2 lines) and collect data rows
+                priorRows = lines.slice(tableStart + 2).filter(l => l.trim().startsWith('|'));
+                // Drop any prior row for this same SHA to avoid duplicates on retries
+                priorRows = priorRows.filter(l => !l.includes(`\`${shortSha}\``));
+              }
+            }
+
+            // Prepend new row, cap at 20
+            const allRows = [newRow, ...priorRows].slice(0, 20);
+
+            const body = [
+              marker,
+              `**Cloudflare Preview** — latest: ${branchUrl}`,
+              '',
+              'Each commit gets its own atomic URL below. Compare any two side by side by opening multiple URLs.',
+              '',
+              tableHeader,
+              ...allRows,
+            ].join('\n');
+
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
