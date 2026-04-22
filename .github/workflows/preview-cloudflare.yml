@@ -39,11 +39,12 @@ jobs:
         id: deploy
         run: |
           set -o pipefail
-          wrangler pages deploy dist --project-name=prototyping-playground --branch=${{ github.ref_name }} | tee deploy.log
+          wrangler pages deploy dist --project-name=prototyping-playground --branch="$BRANCH_NAME" | tee deploy.log
           # Extract the atomic deployment URL (e.g. https://6c27979f.prototyping-playground.pages.dev)
           commit_url=$(grep -oE 'https://[a-f0-9]+\.prototyping-playground\.pages\.dev' deploy.log | head -1)
           echo "commit_url=${commit_url}" >> "$GITHUB_OUTPUT"
         env:
+          BRANCH_NAME: ${{ github.ref_name }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
@@ -54,7 +55,8 @@ jobs:
         with:
           script: |
             const branch = context.ref.replace('refs/heads/', '');
-            const safeBranch = branch.replace(/[\/]/g, '-').substring(0, 60);
+            // Cloudflare Pages branch alias rules: lowercase, non-alphanumeric → hyphen, truncate to 60.
+            const safeBranch = branch.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 60);
             const branchUrl = `https://${safeBranch}.prototyping-playground.pages.dev`;
             const commitUrl = process.env.COMMIT_URL;
             const sha = context.sha;
