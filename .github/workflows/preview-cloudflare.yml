@@ -40,9 +40,14 @@ jobs:
         run: |
           set -o pipefail
           wrangler pages deploy dist --project-name=prototyping-playground --branch="$BRANCH_NAME" | tee deploy.log
-          # Extract the atomic deployment URL (e.g. https://6c27979f.prototyping-playground.pages.dev)
-          commit_url=$(grep -oE 'https://[a-f0-9]+\.prototyping-playground\.pages\.dev' deploy.log | head -1)
+          # Extract URLs from wrangler stdout. `|| true` prevents step failure if
+          # the output format changes and a regex finds no match (deploy already
+          # succeeded by this point — we don't want to fail the step for a
+          # comment-generation issue).
+          commit_url=$(grep -oE 'https://[a-f0-9]+\.prototyping-playground\.pages\.dev' deploy.log | head -1 || true)
+          alias_url=$(sed -n 's/.*Deployment alias URL: \(https:\/\/[^[:space:]]*\).*/\1/p' deploy.log | head -1 || true)
           echo "commit_url=${commit_url}" >> "$GITHUB_OUTPUT"
+          echo "alias_url=${alias_url}" >> "$GITHUB_OUTPUT"
         env:
           BRANCH_NAME: ${{ github.ref_name }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -52,12 +57,16 @@ jobs:
         uses: actions/github-script@v7
         env:
           COMMIT_URL: ${{ steps.deploy.outputs.commit_url }}
+          ALIAS_URL: ${{ steps.deploy.outputs.alias_url }}
         with:
           script: |
             const branch = context.ref.replace('refs/heads/', '');
-            // Cloudflare Pages branch alias rules: lowercase, non-alphanumeric → hyphen, truncate to 60.
-            const safeBranch = branch.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 60);
-            const branchUrl = `https://${safeBranch}.prototyping-playground.pages.dev`;
+            // Prefer the alias URL wrangler actually printed (source of truth
+            // for Cloudflare's alias rules, which change over time). Fall back
+            // to a best-effort reconstruction only if wrangler didn't emit one.
+            // Reconstruction rules as of wrangler 4.30.0: lowercase, non-alphanumeric → hyphen, truncate to 63.
+            const fallbackBranch = branch.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 63);
+            const branchUrl = process.env.ALIAS_URL || `https://${fallbackBranch}.prototyping-playground.pages.dev`;
             const commitUrl = process.env.COMMIT_URL;
             const sha = context.sha;
             const shortSha = sha.substring(0, 7);
