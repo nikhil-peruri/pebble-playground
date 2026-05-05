@@ -1,0 +1,143 @@
+name: Deploy Preview (Cloudflare)
+
+on:
+  push:
+    branches-ignore:
+      - main
+
+concurrency:
+  group: preview-cf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      deployments: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Build
+        run: npm run build
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        run: |
+          set -o pipefail
+          wrangler pages deploy dist --project-name=prototyping-playground --branch="$BRANCH_NAME" | tee deploy.log
+          # Extract URLs from wrangler stdout. `|| true` prevents step failure if
+          # the output format changes and a regex finds no match (deploy already
+          # succeeded by this point — we don't want to fail the step for a
+          # comment-generation issue).
+          commit_url=$(grep -oE 'https://[a-f0-9]+\.prototyping-playground\.pages\.dev' deploy.log | head -1 || true)
+          alias_url=$(sed -n 's/.*Deployment alias URL: \(https:\/\/[^[:space:]]*\).*/\1/p' deploy.log | head -1 || true)
+          echo "commit_url=${commit_url}" >> "$GITHUB_OUTPUT"
+          echo "alias_url=${alias_url}" >> "$GITHUB_OUTPUT"
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Comment preview URL on PR
+        uses: actions/github-script@v7
+        env:
+          COMMIT_URL: ${{ steps.deploy.outputs.commit_url }}
+          ALIAS_URL: ${{ steps.deploy.outputs.alias_url }}
+        with:
+          script: |
+            const branch = context.ref.replace('refs/heads/', '');
+            // Prefer the alias URL wrangler actually printed (source of truth
+            // for Cloudflare's alias rules, which change over time). Fall back
+            // to a best-effort reconstruction only if wrangler didn't emit one.
+            // Reconstruction rules as of wrangler 4.30.0: lowercase, non-alphanumeric → hyphen, truncate to 63.
+            const fallbackBranch = branch.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 63);
+            const branchUrl = process.env.ALIAS_URL || `https://${fallbackBranch}.prototyping-playground.pages.dev`;
+            const commitUrl = process.env.COMMIT_URL;
+            const sha = context.sha;
+            const shortSha = sha.substring(0, 7);
+            const commitLink = `https://github.com/${context.repo.owner}/${context.repo.repo}/commit/${sha}`;
+
+            // Get commit message (first line only)
+            const { data: commit } = await github.rest.repos.getCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: sha,
+            });
+            const message = (commit.commit.message.split('\n')[0] || '').replace(/\|/g, '\\|').substring(0, 80);
+
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${branch}`,
+              state: 'open',
+            });
+            if (prs.length === 0) return;
+
+            const pr = prs[0];
+            const marker = '<!-- cf-preview -->';
+            const tableHeader = '| Commit | Message | Preview |\n|--------|---------|---------|';
+            const newRow = `| [\`${shortSha}\`](${commitLink}) | ${message} | ${commitUrl || 'n/a'} |`;
+
+            // Read existing comment, extract prior rows
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+            });
+            const existing = comments.find(c => c.body?.includes(marker));
+
+            let priorRows = [];
+            if (existing) {
+              const lines = existing.body.split('\n');
+              const tableStart = lines.findIndex(l => l.startsWith('| Commit |'));
+              if (tableStart >= 0) {
+                // Skip header (2 lines) and collect data rows
+                priorRows = lines.slice(tableStart + 2).filter(l => l.trim().startsWith('|'));
+                // Drop any prior row for this same SHA to avoid duplicates on retries
+                priorRows = priorRows.filter(l => !l.includes(`\`${shortSha}\``));
+              }
+            }
+
+            // Prepend new row, cap at 20
+            const allRows = [newRow, ...priorRows].slice(0, 20);
+
+            const body = [
+              marker,
+              `**Cloudflare Preview** — latest: ${branchUrl}`,
+              '',
+              'Each commit gets its own atomic URL below. Compare any two side by side by opening multiple URLs.',
+              '',
+              tableHeader,
+              ...allRows,
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body,
+              });
+            }
